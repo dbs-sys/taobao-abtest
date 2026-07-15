@@ -1,0 +1,13 @@
+# 数据文件
+data/*.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+
+# IDE
+.idea/
