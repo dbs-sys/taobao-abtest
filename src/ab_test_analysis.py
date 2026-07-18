@@ -11,19 +11,30 @@ import seaborn as sns
 from sqlalchemy import create_engine
 import os
 import warnings
+from pathlib import Path
+from dotenv import load_dotenv
 
 warnings.filterwarnings('ignore')
+
+# ============================================
+# 加载环境变量和配置
+# ============================================
+load_dotenv()
+
+# 基于脚本所在目录构建路径
+BASE_DIR = Path(__file__).parent.parent
+OUTPUT_PATH = BASE_DIR / "output"
+OUTPUT_PATH.mkdir(exist_ok=True)
+
+# 从环境变量读取密码
+MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD', '123456')
+ALPHA = 0.05
+# Bonferroni校正：共检验6个指标（2个卡方 + 4个t检验）
+ALPHA_CORRECTED = ALPHA / 6
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
-
-# ============================================
-# 配置参数
-# ============================================
-MYSQL_PASSWORD = "123456"  # ← 改成你的MySQL密码
-ALPHA = 0.05
-OUTPUT_PATH = "./output/"
 
 engine = create_engine(
     f"mysql+pymysql://root:{MYSQL_PASSWORD}@localhost:3306/taobao_abtest?charset=utf8mb4"
@@ -34,10 +45,15 @@ def load_data():
     """从MySQL加载用户指标数据"""
     print("=" * 60)
     print("加载用户指标数据...")
-    df = pd.read_sql("SELECT * FROM user_metrics", engine)
-    print(f"✅ 共 {len(df)} 条用户记录")
-    print(df['group_type'].value_counts())
-    return df
+    try:
+        df = pd.read_sql("SELECT * FROM user_metrics", engine)
+        print(f"✅ 共 {len(df)} 条用户记录")
+        print(df['group_type'].value_counts())
+        return df
+    except Exception as e:
+        print(f"❌ 数据库连接失败: {e}")
+        print("请检查MySQL服务是否启动，以及密码配置是否正确")
+        raise
 
 
 def normality_test(data, sample_size=5000):
@@ -69,29 +85,40 @@ def cohens_d(group_a, group_b):
     return d, pooled_std
 
 
-def confidence_interval(diff, pooled_std, n1, n2, confidence=0.95):
-    """计算置信区间"""
+def confidence_interval_t(diff, pooled_std, n1, n2, confidence=0.95):
+    """使用t分布计算置信区间（更精确）"""
     se = pooled_std * np.sqrt(1 / n1 + 1 / n2)
     alpha = 1 - confidence
-    z_score = stats.norm.ppf(1 - alpha / 2)
-    margin = z_score * se
+    df = n1 + n2 - 2
+    t_score = stats.t.ppf(1 - alpha / 2, df)
+    margin = t_score * se
     return diff - margin, diff + margin
 
 
-def perform_chi_square(df, metric_name, metric_col):
-    """执行卡方检验（针对转化率类指标）"""
+def perform_chi_square(df, metric_name, count_col):
+    """
+    执行卡方检验（针对是否发生转化的0/1变量）
+
+    Parameters:
+    -----------
+    df : DataFrame
+        用户指标数据
+    metric_name : str
+        指标显示名称
+    count_col : str
+        对应的计数列名，如 'buy_count' 或 'cart_count'
+    """
     print(f"\n{'=' * 60}")
     print(f"【{metric_name}】卡方检验分析")
+    print(f"评估维度：新策略是否能显著提高用户的{metric_name}")
     print(f"{'=' * 60}")
 
-    # 将转化率转为0-1变量：大于0视为转化，等于0视为未转化
+    # 使用是否发生转化（0/1变量）
     df_copy = df.copy()
-    df_copy['is_converted'] = (df_copy[metric_col] > 0).astype(int)
+    df_copy['is_converted'] = (df_copy[count_col] > 0).astype(int)
 
     # 构建列联表：分组 × 是否转化
     contingency = pd.crosstab(df_copy['group_type'], df_copy['is_converted'])
-
-    # 确保列名为"未转化"和"转化"
     col_names = {0: '未转化', 1: '转化'}
     contingency = contingency.rename(columns=col_names)
 
@@ -100,11 +127,12 @@ def perform_chi_square(df, metric_name, metric_col):
     print()
 
     # 计算转化率
-    rate_A = df[df['group_type'] == 'A'][metric_col].mean()
-    rate_B = df[df['group_type'] == 'B'][metric_col].mean()
+    rate_A = df_copy[df_copy['group_type'] == 'A']['is_converted'].mean()
+    rate_B = df_copy[df_copy['group_type'] == 'B']['is_converted'].mean()
 
     print(f"A组(对照) 转化率: {rate_A:.4f} ({rate_A * 100:.2f}%)")
     print(f"B组(实验) 转化率: {rate_B:.4f} ({rate_B * 100:.2f}%)")
+    print(f"绝对差异: {(rate_B - rate_A) * 100:.2f} 个百分点")
 
     # 执行卡方检验
     chi2, p_value, dof, expected = chi2_contingency(contingency)
@@ -114,16 +142,10 @@ def perform_chi_square(df, metric_name, metric_col):
     print(f"p值 = {p_value:.6f}")
     print(f"自由度 = {dof}")
 
-    print(f"\n期望频数:")
-    expected_df = pd.DataFrame(expected,
-                               columns=contingency.columns,
-                               index=contingency.index)
-    print(expected_df.round(2))
-
-    # 结论
-    print(f"\n--- 统计结论 ---")
-    if p_value < ALPHA:
-        conclusion = f"✅ 拒绝原假设 (p = {p_value:.4f} < {ALPHA})"
+    # 结论（使用校正后的α）
+    print(f"\n--- 统计结论 (校正后α={ALPHA_CORRECTED:.4f}) ---")
+    if p_value < ALPHA_CORRECTED:
+        conclusion = f"✅ 拒绝原假设 (p = {p_value:.4f} < {ALPHA_CORRECTED:.4f})"
         print(conclusion)
         print(f"两组在【{metric_name}】上存在显著差异!")
         if rate_B > rate_A:
@@ -131,13 +153,13 @@ def perform_chi_square(df, metric_name, metric_col):
         else:
             print(f"对照组(A)转化率显著高于实验组(B)")
     else:
-        conclusion = f"❌ 无法拒绝原假设 (p = {p_value:.4f} >= {ALPHA})"
+        conclusion = f"❌ 无法拒绝原假设 (p = {p_value:.4f} >= {ALPHA_CORRECTED:.4f})"
         print(conclusion)
         print(f"两组在【{metric_name}】上无显著差异")
 
     # 保存结果到MySQL
     result_df = pd.DataFrame([{
-        'metric_name': metric_name,
+        'metric_name': f"{metric_name}_卡方",
         'test_type': 'chi_square',
         'group_a_mean': round(rate_A, 6),
         'group_b_mean': round(rate_B, 6),
@@ -152,6 +174,7 @@ def perform_chi_square(df, metric_name, metric_col):
         'ci_upper': None,
         'chi2_statistic': round(chi2, 6),
         'dof': dof,
+        'alpha_used': ALPHA_CORRECTED,
         'conclusion': conclusion
     }])
     result_df.to_sql('ab_test_results', engine, if_exists='append', index=False)
@@ -167,9 +190,21 @@ def perform_chi_square(df, metric_name, metric_col):
 
 
 def perform_ttest(df, metric_name, metric_col):
-    """执行完整的t检验流程"""
+    """
+    执行完整的t检验流程（针对连续型指标）
+
+    Parameters:
+    -----------
+    df : DataFrame
+        用户指标数据
+    metric_name : str
+        指标显示名称
+    metric_col : str
+        对应的数据列名
+    """
     print(f"\n{'=' * 60}")
     print(f"【{metric_name}】t检验分析")
+    print(f"评估维度：新策略是否能显著提升用户的{metric_name}水平")
     print(f"{'=' * 60}")
 
     group_a = df[df['group_type'] == 'A'][metric_col].dropna()
@@ -211,8 +246,19 @@ def perform_ttest(df, metric_name, metric_col):
     print(f"t统计量 = {t_stat:.4f}")
     print(f"p值 = {p_value:.6f}")
 
-    # 4. 效应量
-    print(f"\n--- 4. 效应量分析 ---")
+    # 4. Bootstrap验证
+    print(f"\n--- 4. Bootstrap验证 (1000次重采样) ---")
+    bootstrap_diffs = []
+    np.random.seed(42)
+    for _ in range(1000):
+        sample_a = group_a.sample(n=n_a, replace=True)
+        sample_b = group_b.sample(n=n_b, replace=True)
+        bootstrap_diffs.append(sample_b.mean() - sample_a.mean())
+    bootstrap_p = (np.abs(np.array(bootstrap_diffs)) >= abs(mean_b - mean_a)).mean()
+    print(f"Bootstrap p值 = {bootstrap_p:.6f}")
+
+    # 5. 效应量
+    print(f"\n--- 5. 效应量分析 ---")
     d, pooled_std = cohens_d(group_a, group_b)
     print(f"Cohen's d = {d:.4f}")
 
@@ -226,17 +272,18 @@ def perform_ttest(df, metric_name, metric_col):
         effect_size = "大效应"
     print(f"效应量解释: {effect_size}")
 
-    # 5. 置信区间
-    print(f"\n--- 5. 95%置信区间 ---")
+    # 6. 置信区间（使用t分布）
+    print(f"\n--- 6. 95%置信区间 ---")
     diff = mean_b - mean_a
-    ci_lower, ci_upper = confidence_interval(diff, pooled_std, n_a, n_b)
+    ci_lower, ci_upper = confidence_interval_t(diff, pooled_std, n_a, n_b)
     print(f"均值差异 (B - A) = {diff:.6f}")
     print(f"95% CI: [{ci_lower:.6f}, {ci_upper:.6f}]")
 
-    # 6. 结论
-    print(f"\n--- 6. 统计结论 ---")
-    if p_value < ALPHA:
-        conclusion = f"✅ 拒绝原假设 (p = {p_value:.4f} < {ALPHA})"
+    # 7. 结论（使用校正后的α，但报告时两个p值都给出）
+    print(f"\n--- 7. 统计结论 (校正后α={ALPHA_CORRECTED:.4f}) ---")
+    p_final = max(p_value, bootstrap_p)  # 保守估计
+    if p_final < ALPHA_CORRECTED:
+        conclusion = f"✅ 拒绝原假设 (p_t={p_value:.4f}, p_bootstrap={bootstrap_p:.4f} < {ALPHA_CORRECTED:.4f})"
         print(conclusion)
         print(f"两组在【{metric_name}】上存在显著差异!")
         if mean_b > mean_a:
@@ -244,13 +291,13 @@ def perform_ttest(df, metric_name, metric_col):
         else:
             print(f"对照组(A)显著高于实验组(B)")
     else:
-        conclusion = f"❌ 无法拒绝原假设 (p = {p_value:.4f} >= {ALPHA})"
+        conclusion = f"❌ 无法拒绝原假设 (p_t={p_value:.4f}, p_bootstrap={bootstrap_p:.4f} >= {ALPHA_CORRECTED:.4f})"
         print(conclusion)
         print(f"两组在【{metric_name}】上无显著差异")
 
     # 保存结果到MySQL
     result_df = pd.DataFrame([{
-        'metric_name': metric_name,
+        'metric_name': f"{metric_name}_t检验",
         'test_type': 't_test',
         'group_a_mean': round(mean_a, 6),
         'group_b_mean': round(mean_b, 6),
@@ -259,12 +306,15 @@ def perform_ttest(df, metric_name, metric_col):
         'group_a_n': n_a,
         'group_b_n': n_b,
         't_statistic': round(t_stat, 6),
-        'p_value': round(p_value, 6),
+        'p_value': round(p_final, 6),
+        'p_value_raw': round(p_value, 6),
+        'p_value_bootstrap': round(bootstrap_p, 6),
         'cohens_d': round(d, 6),
         'ci_lower': round(ci_lower, 6),
         'ci_upper': round(ci_upper, 6),
         'chi2_statistic': None,
         'dof': None,
+        'alpha_used': ALPHA_CORRECTED,
         'conclusion': conclusion
     }])
     result_df.to_sql('ab_test_results', engine, if_exists='append', index=False)
@@ -277,16 +327,16 @@ def perform_ttest(df, metric_name, metric_col):
         'std_a': std_a, 'std_b': std_b,
         'n_a': n_a, 'n_b': n_b,
         't_stat': t_stat, 'p_value': p_value,
+        'bootstrap_p': bootstrap_p,
         'cohens_d': d, 'ci_lower': ci_lower, 'ci_upper': ci_upper,
         'conclusion': conclusion
     }
 
 
-def visualize(df, t_results, chi_results, save_path='./output/'):
-    """优化版可视化：生成5张高质量图表"""
+def visualize(df, t_results, chi_results):
+    """生成5张可视化图表"""
     print(f"\n{'=' * 60}")
     print("生成可视化图表...")
-    os.makedirs(save_path, exist_ok=True)
 
     colors = {'A': '#3498db', 'B': '#e74c3c'}
 
@@ -308,9 +358,9 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
         ax.set_xlim(0, min(0.5, df[col].quantile(0.99)))
 
     plt.tight_layout()
-    plt.savefig(f'{save_path}fig1_conversion_kde.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_PATH / 'fig1_conversion_kde.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✅ {save_path}fig1_conversion_kde.png")
+    print(f"✅ {OUTPUT_PATH}/fig1_conversion_kde.png")
 
     # ========== 图2: 行为次数小提琴图 ==========
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -348,14 +398,14 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
                 ha='center', va='bottom', fontsize=9, color='#e74c3c', fontweight='bold')
 
     plt.tight_layout()
-    plt.savefig(f'{save_path}fig2_behavior_violin.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_PATH / 'fig2_behavior_violin.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✅ {save_path}fig2_behavior_violin.png")
+    print(f"✅ {OUTPUT_PATH}/fig2_behavior_violin.png")
 
     # ========== 图3: t检验结果汇总表 ==========
-    fig, ax = plt.subplots(figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(14, 6))
 
-    columns = ['指标', 'A组均值', 'B组均值', 't统计量', 'p值', "Cohen's d", '结论']
+    columns = ['指标', 'A组均值', 'B组均值', 't统计量', '原始p值', 'Bootstrap p值', "Cohen's d", '结论']
     table_data = []
     for r in t_results:
         table_data.append([
@@ -364,15 +414,16 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
             f"{r['mean_b']:.4f}",
             f"{r['t_stat']:.4f}",
             f"{r['p_value']:.4f}",
+            f"{r['bootstrap_p']:.4f}",
             f"{r['cohens_d']:.4f}",
-            '❌ 不显著' if r['p_value'] >= 0.05 else '✅ 显著'
+            '❌ 不显著' if r['bootstrap_p'] >= ALPHA_CORRECTED else '✅ 显著'
         ])
 
     table = ax.table(cellText=table_data, colLabels=columns,
                      cellLoc='center', loc='center',
-                     colWidths=[0.16, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12])
+                     colWidths=[0.13, 0.11, 0.11, 0.11, 0.12, 0.14, 0.11, 0.11])
     table.auto_set_font_size(False)
-    table.set_fontsize(11)
+    table.set_fontsize(10)
     table.scale(1.2, 2.2)
 
     for i in range(len(columns)):
@@ -382,17 +433,18 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
     for i in range(1, len(table_data) + 1):
         for j in range(len(columns)):
             table[(i, j)].set_facecolor('#ecf0f1' if i % 2 == 0 else '#ffffff')
-        p_val = float(table_data[i - 1][4])
-        bg = '#d5f5e3' if p_val < 0.05 else '#fadbd8'
-        table[(i, 4)].set_facecolor(bg)
-        table[(i, 6)].set_facecolor(bg)
+        p_val = float(table_data[i - 1][5])  # Bootstrap p值
+        bg = '#d5f5e3' if p_val < ALPHA_CORRECTED else '#fadbd8'
+        table[(i, 5)].set_facecolor(bg)
+        table[(i, 7)].set_facecolor(bg)
 
     ax.axis('off')
-    ax.set_title('淘宝AB测试 - t检验结果汇总表', fontsize=16, fontweight='bold', pad=20)
+    ax.set_title(f'淘宝AB测试 - t检验结果汇总表 (Bonferroni校正α={ALPHA_CORRECTED:.4f})',
+                 fontsize=14, fontweight='bold', pad=20)
     plt.tight_layout()
-    plt.savefig(f'{save_path}fig3_results_table.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_PATH / 'fig3_results_table.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✅ {save_path}fig3_results_table.png")
+    print(f"✅ {OUTPUT_PATH}/fig3_results_table.png")
 
     # ========== 图4: 均值差异置信区间 ==========
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -430,13 +482,13 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
     ax.legend(handles=legend_elements, loc='lower right', fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(f'{save_path}fig4_mean_diff_ci.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_PATH / 'fig4_mean_diff_ci.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✅ {save_path}fig4_mean_diff_ci.png")
+    print(f"✅ {OUTPUT_PATH}/fig4_mean_diff_ci.png")
 
-    # ========== 新增图5: 卡方检验结果汇总表 ==========
+    # ========== 图5: 卡方检验结果汇总表 ==========
     if chi_results:
-        fig, ax = plt.subplots(figsize=(12, 3))
+        fig, ax = plt.subplots(figsize=(12, 4))
 
         columns = ['指标', 'A组转化率', 'B组转化率', 'χ²统计量', 'p值', '结论']
         table_data = []
@@ -447,7 +499,7 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
                 f"{r['rate_b']:.4f}",
                 f"{r['chi2']:.4f}",
                 f"{r['p_value']:.4f}",
-                '❌ 不显著' if r['p_value'] >= 0.05 else '✅ 显著'
+                '❌ 不显著' if r['p_value'] >= ALPHA_CORRECTED else '✅ 显著'
             ])
 
         table = ax.table(cellText=table_data, colLabels=columns,
@@ -465,47 +517,54 @@ def visualize(df, t_results, chi_results, save_path='./output/'):
             for j in range(len(columns)):
                 table[(i, j)].set_facecolor('#ecf0f1' if i % 2 == 0 else '#ffffff')
             p_val = float(table_data[i - 1][4])
-            bg = '#d5f5e3' if p_val < 0.05 else '#fadbd8'
+            bg = '#d5f5e3' if p_val < ALPHA_CORRECTED else '#fadbd8'
             table[(i, 4)].set_facecolor(bg)
             table[(i, 5)].set_facecolor(bg)
 
         ax.axis('off')
-        ax.set_title('淘宝AB测试 - 卡方检验结果汇总表', fontsize=16, fontweight='bold', pad=20)
+        ax.set_title(f'淘宝AB测试 - 卡方检验结果汇总表 (Bonferroni校正α={ALPHA_CORRECTED:.4f})',
+                     fontsize=14, fontweight='bold', pad=20)
         plt.tight_layout()
-        plt.savefig(f'{save_path}fig5_chi_square_table.png', dpi=150, bbox_inches='tight')
+        plt.savefig(OUTPUT_PATH / 'fig5_chi_square_table.png', dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"✅ {save_path}fig5_chi_square_table.png")
+        print(f"✅ {OUTPUT_PATH}/fig5_chi_square_table.png")
 
 
 def main():
     """主函数"""
     print("\n" + "=" * 60)
-    print("淘宝AB测试")
+    print("淘宝AB测试分析")
+    print(f"显著性水平: α = {ALPHA} (Bonferroni校正后 α = {ALPHA_CORRECTED:.4f})")
     print("=" * 60)
 
+    # 加载数据
     df = load_data()
 
-    # ========== 卡方检验（针对0-1转化率类指标）==========
+    # ========== 卡方检验（评估"是否转化"的比率差异）==========
     print("\n" + "=" * 60)
-    print("开始卡方检验（转化率类指标）")
+    print("开始卡方检验 (评估维度：转化率差异)")
     print("=" * 60)
 
-    chi_metrics = [
-        ('购买转化率', 'conversion_rate'),
-        ('加购转化率', 'cart_rate')
+    chi_configs = [
+        ('购买转化率', 'buy_count'),
+        ('加购转化率', 'cart_count')
     ]
 
     chi_results = []
-    for metric_name, metric_col in chi_metrics:
-        result = perform_chi_square(df, metric_name, metric_col)
-        chi_results.append(result)
+    for metric_name, count_col in chi_configs:
+        # 检查列是否存在
+        if count_col in df.columns:
+            result = perform_chi_square(df, metric_name, count_col)
+            chi_results.append(result)
+        else:
+            print(f"⚠️ 列 '{count_col}' 不存在，跳过卡方检验")
 
-    # ========== t检验（针对连续型指标）==========
+    # ========== t检验（评估"转化深度/行为强度"的差异）==========
     print("\n" + "=" * 60)
-    print("开始t检验（连续型指标）")
+    print("开始t检验 (评估维度：行为强度差异)")
     print("=" * 60)
 
-    t_metrics = [
+    t_configs = [
         ('购买转化率', 'conversion_rate'),
         ('加购转化率', 'cart_rate'),
         ('点击次数', 'pv_count'),
@@ -515,17 +574,21 @@ def main():
     ]
 
     t_results = []
-    for metric_name, metric_col in t_metrics:
-        result = perform_ttest(df, metric_name, metric_col)
-        t_results.append(result)
+    for metric_name, metric_col in t_configs:
+        if metric_col in df.columns:
+            result = perform_ttest(df, metric_name, metric_col)
+            t_results.append(result)
+        else:
+            print(f"⚠️ 列 '{metric_col}' 不存在，跳过t检验")
 
     # 可视化
-    visualize(df, t_results, chi_results, OUTPUT_PATH)
+    visualize(df, t_results, chi_results)
 
     print(f"\n{'=' * 60}")
     print("AB测试分析全部完成!")
     print(f"结果保存在: {OUTPUT_PATH}")
     print(f"MySQL表: ab_test_results")
+    print(f"显著性水平: α = {ALPHA}, 校正后 α = {ALPHA_CORRECTED:.4f}")
     print(f"{'=' * 60}")
 
 
